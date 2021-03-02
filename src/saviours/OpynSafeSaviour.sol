@@ -15,8 +15,9 @@
 
 pragma solidity 0.6.7;
 
+pragma experimental ABIEncoderV2;
+
 import "../interfaces/SafeSaviourLike.sol";
-import "../interfaces/WETHLike.sol";
 import "../interfaces/OpynV2OTokenLike.sol";
 import "../interfaces/OpynV2ControllerLike.sol";
 import "../interfaces/OpynV2WhitelistLike.sol";
@@ -38,8 +39,6 @@ contract OpynSafeSaviour is SafeMath, SafeSaviourLike {
     OpynV2ControllerLike        public opynV2Controller;
     // The Opyn v2 Whitelist to check oTokens' validity
     OpynV2WhitelistLike        public opynV2Whitelist;
-    // The address of the WETH token
-    WETHLike                    public wethContract;
 
     // --- Events ---
     event Deposit(address indexed caller, address indexed safeHandler, uint256 amount);
@@ -55,7 +54,6 @@ contract OpynSafeSaviour is SafeMath, SafeSaviourLike {
       address saviourRegistry_,
       address opynV2Controller_,
       address opynV2Whitelist_,
-      address wethContract_,
       uint256 keeperPayout_,
       uint256 minKeeperPayoutValue_,
       uint256 payoutToSAFESize_,
@@ -68,7 +66,6 @@ contract OpynSafeSaviour is SafeMath, SafeSaviourLike {
         require(saviourRegistry_ != address(0), "OpynSafeSaviour/null-saviour-registry");
         require(opynV2Controller_ != address(0), "OpynSafeSaviour/null-opyn-v2-controller");
         require(opynV2Whitelist_ != address(0), "OpynSafeSaviour/null-opyn-v2-whitelist");
-        require(wethContract_ != address(0), "OpynSafeSaviour/null-weth-contract");
         require(keeperPayout_ > 0, "OpynSafeSaviour/invalid-keeper-payout");
         require(defaultDesiredCollateralizationRatio_ > 0, "OpynSafeSaviour/null-default-cratio");
         require(payoutToSAFESize_ > 1, "OpynSafeSaviour/invalid-payout-to-safe-size");
@@ -87,7 +84,6 @@ contract OpynSafeSaviour is SafeMath, SafeSaviourLike {
         collateralToken      = ERC20Like(collateralJoin.collateral());
         opynV2Controller     = OpynV2ControllerLike(opynV2Controller_);
         opynV2Whitelist      = OpynV2WhitelistLike(opynV2Whitelist_);
-        wethContract         = WETHLike(wethContract_);
 
         require(address(safeEngine) != address(0), "OpynSafeSaviour/null-safe-engine");
         uint256 scaledLiquidationRatio = oracleRelayer.liquidationCRatio(collateralJoin.collateralType()) / CRATIO_SCALE_DOWN;
@@ -117,7 +113,7 @@ contract OpynSafeSaviour is SafeMath, SafeSaviourLike {
     // Check if oToken collateral asset is WETH and is put option
     (address collateral, , , , , bool isPut) = OpynV2OTokenLike(oToken).getOtokenDetails();
 
-    require(collateral == address(wethContract), "OpynSafeSaviour/collateral-not-weth");
+    require(collateral == collateralJoin.collateral(), "OpynSafeSaviour/collateral-not-weth");
     require(isPut == true, "OpynSafeSaviour/option-not-put");
 
     if (oTokenWhitelist[oToken] == 0) {
@@ -255,33 +251,32 @@ contract OpynSafeSaviour is SafeMath, SafeSaviourLike {
 
         uint256 exactOTokenAmount = mul(div(oTokenCover[safeHandler], payout), requiredTokenAmount);
 
-        // Build Opyn Action
-        ActionArgsLike[] memory redeemAction = new ActionArgsLike[](1);
-        redeemAction[0].actionType = ActionTypeLike.Redeem;
-        redeemAction[0].owner = address(0);
-        redeemAction[0].secondAddress = address(this);
-        redeemAction[0].asset = oTokenSelection[safeHandler];
-        redeemAction[0].vaultId = 0;
-        redeemAction[0].amount = exactOTokenAmount;
+        {
+            // Build Opyn Action
+            ActionArgsLike[] memory redeemAction = new ActionArgsLike[](1);
+            redeemAction[0].actionType = ActionTypeLike.Redeem;
+            redeemAction[0].owner = address(0);
+            redeemAction[0].secondAddress = address(this);
+            redeemAction[0].asset = oTokenSelection[safeHandler];
+            redeemAction[0].vaultId = 0;
+            redeemAction[0].amount = exactOTokenAmount;
 
-        // Retrieve pre-redeem WETH balance
-        uint256 wethBalance = wethContract.balanceOf(address(this));
+            // Retrieve pre-redeem WETH balance
+            uint256 wethBalance = ERC20Like(collateralJoin.collateral()).balanceOf(address(this));
 
-        opynV2Controller.operate(redeemAction);
+            opynV2Controller.operate(redeemAction);
 
-        // Retrieve post-redeem WETH balance
-        uint256 postRedeemWethBalance = wethContract.balanceOf(address(this));
+            // Retrieve post-redeem WETH balance
+            uint256 postRedeemWethBalance = ERC20Like(collateralJoin.collateral()).balanceOf(address(this));
 
-        // Check that balance has increased
-        require(postRedeemWethBalance > wethBalance, "OpynSafeSaviour/no-balance-increase-after-redeem");
+            // Check that balance has increased
+            require(postRedeemWethBalance > wethBalance, "OpynSafeSaviour/no-balance-increase-after-redeem");
 
-        uint256 receivedAmount = postRedeemWethBalance - wethBalance;
+            uint256 receivedAmount = postRedeemWethBalance - wethBalance;
 
-        // Check that balance has increased of at least required amount
-        require(receivedAmount >= requiredTokenAmount, "OpynSafeSaviour/not-enough-otoken-collateral-redeemed");
-
-        // unwrap WETH into ETH
-        wethContract.withdraw(receivedAmount);
+            // Check that balance has increased of at least required amount
+            require(receivedAmount >= requiredTokenAmount, "OpynSafeSaviour/not-enough-otoken-collateral-redeemed");
+        }
 
         // Update the remaining cover
         oTokenCover[safeHandler] = sub(oTokenCover[safeHandler], exactOTokenAmount);
