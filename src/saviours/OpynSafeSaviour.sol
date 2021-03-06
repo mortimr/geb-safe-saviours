@@ -213,6 +213,119 @@ contract OpynSafeSaviour is SafeMath, SafeSaviourLike {
         emit SetDesiredCollateralizationRatio(msg.sender, safeID, safeHandler, cRatio);
     }
 
+    /*
+    * @notice Computes the minimum oToken collateral amount required to be able to swap for required amount of safe collateral
+    * @param oTokenCollateralAddress The ERC20 contract of the oToken collateral
+    * @param requiredTokenAmount the amount of safe collateral required at the end of the redeem / swap process
+    * @return The minimum amount of oToken collateral that the contract should try to redeem
+    */
+    function _retrieveRequiredOTokenCollateralAmount(address oTokenCollateralAddress, uint256 requiredTokenAmount) internal view returns (uint256) {
+
+        // Path argument for the uniswap router
+        address[] memory path = new address[](2);
+        path[0] = oTokenCollateralAddress;
+        path[1] = collateralJoin.collateral();
+
+        return uniswapV2Router02.getAmountsIn(requiredTokenAmount, path)[0];
+
+    }
+
+    /*
+    * @notice Compute the exact amount of oTokens that should be redeemed
+    * @param safeHandler The safe currently being saved
+    * @param oTokenCollateralAddress The ERC20 contract of the oToken collateral
+    * @param requiredTokenAmount the amount of safe collateral required at the end of the redeem / swap process
+    * @return The amount of oToken that should be redeemed
+    */
+    function _retrieveRequiredOTokenAmount(address safeHandler, address oTokenCollateralAddress, uint256 requiredTokenAmount) internal view returns (uint256) {
+
+        // This call reverts if not expired. Retrieves the amount of option collateral retrievable
+        uint256 oTokenPayout = opynV2Controller.getPayout(oTokenSelection[safeHandler], oTokenCover[safeHandler]);
+
+        // Amount of oToken collateral needed as input for the uniswap call in order to end up
+        // with requiredTokenAmount as result
+        uint256 amount = _retrieveRequiredOTokenCollateralAmount(oTokenCollateralAddress, requiredTokenAmount);
+
+        // Check that the amount of collateral to swap is retrievable
+        require(amount <= oTokenPayout, "OpynSafeSaviour/insufficient-opyn-payout");
+
+        uint256 track = div(mul(oTokenCover[safeHandler], amount), oTokenPayout);
+
+        // In the case where 1 oToken would retrieve more than 1 collateral and because integer division would round towards 0
+        // ex: 1 oToken retrieves 3 collateral, 5 collateral required, and user owns 2 oToken => (2 * 5) / (2 * 3) => 1.666667 gets rounded to 1, but 2 is required to save
+        // To tackle this, if we have a division remainder and spare oTokens, we increase the used oToken balance by 1
+        if (mod(mul(oTokenCover[safeHandler], amount), oTokenPayout) != 0) {
+          track += 1;
+        }
+
+        // Check that there are enough oTokens after rounding fix
+        require(track < oTokenCover[safeHandler], "OpynSafeSaviour/insufficient-otokens");
+
+        return track;
+
+    }
+
+    /*
+    * @notice Redeems the oToken collateral
+    * @param safeHandler The safe currently being saved
+    * @param oTokenCollateralAddress The ERC20 contract of the oToken collateral
+    * @param track The amount of oTokens to redeem
+    * @return The amount of oToken collateral redeemed
+    */
+    function _redeemOTokenCollateral(address safeHandler, address oTokenCollateralAddress, uint256 track) internal returns (uint256) {
+
+        // Build Opyn Action
+        ActionArgsLike[] memory redeemAction = new ActionArgsLike[](1);
+        redeemAction[0].actionType = ActionTypeLike.Redeem;
+        redeemAction[0].owner = address(0);
+        redeemAction[0].secondAddress = address(this);
+        redeemAction[0].asset = oTokenSelection[safeHandler];
+        redeemAction[0].vaultId = 0;
+        redeemAction[0].amount = track;
+
+        // Retrieve pre-redeem collateral balance
+        uint256 oTokenCollateralBalance = ERC20Like(oTokenCollateralAddress).balanceOf(address(this));
+
+        // Trigger oToken collateral redeem
+        opynV2Controller.operate(redeemAction);
+
+        // Update the remaining cover
+        oTokenCover[safeHandler] = sub(oTokenCover[safeHandler], track);
+
+        // Update the tracked balance to the amount retrieved. Would overflow and throw if balance decreased
+        return sub(ERC20Like(oTokenCollateralAddress).balanceOf(address(this)), oTokenCollateralBalance);
+
+    }
+    
+    /*
+    * @notice Swap redeemed oToken collateral for safe collateral
+    * @param oTokenCollateralAddress The ERC20 contract of the oToken collateral
+    * @param track The amount of oTokens to redeem
+    * @param requiredTokenAmount The amount of safe collateral to retrieve
+    * @return The amount of safe collateral retrieved from the swap
+    */
+    function _swapOTokenCollateralForSafeCollateral(address oTokenCollateralAddress, uint256 track, uint256 requiredTokenAmount) internal returns (uint256) {
+
+        // Retrieve pre-swap WETH balance
+        uint256 wethBalance = ERC20Like(collateralJoin.collateral()).balanceOf(address(this));
+
+        { // Stack too deep guard #4.1
+
+          // Path argument for the uniswap router
+          address[] memory path = new address[](2);
+          path[0] = oTokenCollateralAddress;
+          path[1] = collateralJoin.collateral();
+
+          ERC20Like(oTokenCollateralAddress).approve(address(uniswapV2Router02), track);
+
+          uniswapV2Router02.swapExactTokensForTokens(track, requiredTokenAmount, path, address(this), block.timestamp);
+        }
+
+        // Retrieve post-swap WETH balance. Would overflow and throw if balance decreased
+        return sub(ERC20Like(collateralJoin.collateral()).balanceOf(address(this)), wethBalance);
+
+    }
+
     // --- Saving Logic ---
     /*
     * @notice Saves a SAFE by adding more collateralToken into it
@@ -243,7 +356,7 @@ contract OpynSafeSaviour is SafeMath, SafeSaviourLike {
         // Retrieve the oTokenCollateral address
         (address oTokenCollateralAddress, , , , , ) = OpynV2OTokenLike(oTokenSelection[safeHandler]).getOtokenDetails();
 
-        { // Stack too deep guard #1
+        { // Stack too deep guard
 
           // Check that the amount of collateral locked in the safe is bigger than the keeper's payout
           (uint256 safeLockedCollateral,) =
@@ -252,110 +365,26 @@ contract OpynSafeSaviour is SafeMath, SafeSaviourLike {
 
         }
 
-          // Compute and check the validity of the amount of collateralToken used to save the SAFE
-          require(both(tokenAmountUsed != MAX_UINT, tokenAmountUsed != 0), "OpynSafeSaviour/invalid-tokens-used-to-save");
+        // Compute and check the validity of the amount of collateralToken used to save the SAFE
+        require(both(tokenAmountUsed != MAX_UINT, tokenAmountUsed != 0), "OpynSafeSaviour/invalid-tokens-used-to-save");
 
-          // Check if oToken balance is not empty
-          require(oTokenCover[safeHandler] > 0, "OpynSafeSaviour/empty-otoken-balance");
+        // Check if oToken balance is not empty
+        require(oTokenCover[safeHandler] > 0, "OpynSafeSaviour/empty-otoken-balance");
 
-          // The actual required collateral to provide is the sum of what is needed to bring the safe to its desired collateral ratio + the keeper reward
-          uint256 requiredTokenAmount = add(keeperPayout, tokenAmountUsed);
+        // The actual required collateral to provide is the sum of what is needed to bring the safe to its desired collateral ratio + the keeper reward
+        uint256 requiredTokenAmount = add(keeperPayout, tokenAmountUsed);
 
-          // Track balance through redeem / swaps.
-          uint256 track;
+        // Track balance through redeem / swaps.
+        uint256 track = _retrieveRequiredOTokenAmount(safeHandler, oTokenCollateralAddress, requiredTokenAmount);
+        track = _redeemOTokenCollateral(safeHandler, oTokenCollateralAddress, track);
+        track = _swapOTokenCollateralForSafeCollateral(oTokenCollateralAddress, track, requiredTokenAmount);
 
-        { // Stack too deep guard #2
+        // Check that balance has increased of at least required amount
+        require(track >= requiredTokenAmount, "OpynSafeSaviour/not-enough-otoken-collateral-swapped");
 
-          // This call reverts if not expired. Retrieves the amount of option collateral retrievable
-          uint256 oTokenPayout = opynV2Controller.getPayout(oTokenSelection[safeHandler], oTokenCover[safeHandler]);
-
-          // Amount of oToken collateral needed as input for the uniswap call in order to end up
-          // with requiredTokenAmount as result
-          uint256 amount;
-
-        { // Stack too deep guard #2.1
-
-          // Path argument for the uniswap router
-          address[] memory path = new address[](2);
-          path[0] = oTokenCollateralAddress;
-          path[1] = collateralJoin.collateral();
-
-          uint256[] memory amounts = uniswapV2Router02.getAmountsIn(requiredTokenAmount, path);
-
-          amount = amounts[0];
-
-        }
-
-          // Check that the amount of collateral to swap is retrievable
-          require(amount <= oTokenPayout, "OpynSafeSaviour/insufficient-opyn-payout");
-
-          track = div(mul(oTokenCover[safeHandler], amount), oTokenPayout);
-
-          // In the case where 1 oToken would retrieve more than 1 collateral and because integer division would round towards 0
-          // ex: 1 oToken retrieves 3 collateral, 5 collateral required, and user owns 2 oToken => (2 * 5) / (2 * 3) => 1.666667 gets rounded to 1, but 2 is required to save
-          // To tackle this, if we have a division remainder and spare oTokens, we increase the used oToken balance by 1
-          if (mod(mul(oTokenCover[safeHandler], amount), oTokenPayout) != 0) {
-            track += 1;
-          }
-
-          // Check that there are enough oTokens after rounding fix
-          require(track < oTokenCover[safeHandler], "OpynSafeSaviour/insufficient-otokens");
-
-        }
-
-
-        { // Stack too deep guard #3
-
-            // Build Opyn Action
-            ActionArgsLike[] memory redeemAction = new ActionArgsLike[](1);
-            redeemAction[0].actionType = ActionTypeLike.Redeem;
-            redeemAction[0].owner = address(0);
-            redeemAction[0].secondAddress = address(this);
-            redeemAction[0].asset = oTokenSelection[safeHandler];
-            redeemAction[0].vaultId = 0;
-            redeemAction[0].amount = track;
-
-            // Retrieve pre-redeem collateral balance
-            uint256 oTokenCollateralBalance = ERC20Like(oTokenCollateralAddress).balanceOf(address(this));
-
-            // Trigger oToken collateral redeem
-            opynV2Controller.operate(redeemAction);
-
-            // Update the remaining cover
-            oTokenCover[safeHandler] = sub(oTokenCover[safeHandler], track);
-
-            // Update the tracked balance to the amount retrieved. Would overflow and throw if balance decreased
-            track = sub(ERC20Like(oTokenCollateralAddress).balanceOf(address(this)), oTokenCollateralBalance);
-        }
-
-        { // Stack too deep guard #4
-
-            // Retrieve pre-swap WETH balance
-            uint256 wethBalance = ERC20Like(collateralJoin.collateral()).balanceOf(address(this));
-
-            { // Stack too deep guard #4.1
-
-              // Path argument for the uniswap router
-              address[] memory path = new address[](2);
-              path[0] = oTokenCollateralAddress;
-              path[1] = collateralJoin.collateral();
-
-              ERC20Like(oTokenCollateralAddress).approve(address(uniswapV2Router02), track);
-
-              uniswapV2Router02.swapExactTokensForTokens(track, requiredTokenAmount, path, address(this), block.timestamp);
-            }
-
-            // Retrieve post-swap WETH balance. Would overflow and throw if balance decreased
-            track = sub(ERC20Like(collateralJoin.collateral()).balanceOf(address(this)), wethBalance);
-
-            // Check that balance has increased of at least required amount
-            require(track >= requiredTokenAmount, "OpynSafeSaviour/not-enough-otoken-collateral-swapped");
-
-            // Update balance in case of excess
-            if (track > requiredTokenAmount) {
-              requiredTokenAmount = track;
-            }
-
+        // Update balance in case of excess
+        if (track > requiredTokenAmount) {
+          requiredTokenAmount = track;
         }
 
         // Mark the SAFE in the registry as just being saved
