@@ -21,6 +21,7 @@ import "../interfaces/SafeSaviourLike.sol";
 import "../interfaces/OpynV2OTokenLike.sol";
 import "../interfaces/OpynV2ControllerLike.sol";
 import "../interfaces/OpynV2WhitelistLike.sol";
+import "../interfaces/UniswapV2Router02Like.sol";
 import "../math/SafeMath.sol";
 
 contract OpynSafeSaviour is SafeMath, SafeSaviourLike {
@@ -38,7 +39,9 @@ contract OpynSafeSaviour is SafeMath, SafeSaviourLike {
     // The Opyn v2 Controller to interact with oTokens
     OpynV2ControllerLike        public opynV2Controller;
     // The Opyn v2 Whitelist to check oTokens' validity
-    OpynV2WhitelistLike        public opynV2Whitelist;
+    OpynV2WhitelistLike         public opynV2Whitelist;
+    // The Uniswap v2 router 02 to swap collaterals
+    UniswapV2Router02Like       public uniswapV2Router02;
 
     // --- Events ---
     event Deposit(address indexed caller, address indexed safeHandler, uint256 amount);
@@ -52,8 +55,7 @@ contract OpynSafeSaviour is SafeMath, SafeSaviourLike {
       address oracleRelayer_,
       address safeManager_,
       address saviourRegistry_,
-      address opynV2Controller_,
-      address opynV2Whitelist_,
+      address[3] memory opynSaviourDependencies_,
       uint256 keeperPayout_,
       uint256 minKeeperPayoutValue_,
       uint256 payoutToSAFESize_,
@@ -64,8 +66,9 @@ contract OpynSafeSaviour is SafeMath, SafeSaviourLike {
         require(oracleRelayer_ != address(0), "OpynSafeSaviour/null-oracle-relayer");
         require(safeManager_ != address(0), "OpynSafeSaviour/null-safe-manager");
         require(saviourRegistry_ != address(0), "OpynSafeSaviour/null-saviour-registry");
-        require(opynV2Controller_ != address(0), "OpynSafeSaviour/null-opyn-v2-controller");
-        require(opynV2Whitelist_ != address(0), "OpynSafeSaviour/null-opyn-v2-whitelist");
+        require(opynSaviourDependencies_[0] != address(0), "OpynSafeSaviour/null-opyn-v2-controller");
+        require(opynSaviourDependencies_[1] != address(0), "OpynSafeSaviour/null-opyn-v2-whitelist");
+        require(opynSaviourDependencies_[2] != address(0), "OpynSafeSaviour/null-uniswap-v2-router02");
         require(keeperPayout_ > 0, "OpynSafeSaviour/invalid-keeper-payout");
         require(defaultDesiredCollateralizationRatio_ > 0, "OpynSafeSaviour/null-default-cratio");
         require(payoutToSAFESize_ > 1, "OpynSafeSaviour/invalid-payout-to-safe-size");
@@ -82,14 +85,18 @@ contract OpynSafeSaviour is SafeMath, SafeSaviourLike {
         safeManager          = GebSafeManagerLike(safeManager_);
         saviourRegistry      = SAFESaviourRegistryLike(saviourRegistry_);
         collateralToken      = ERC20Like(collateralJoin.collateral());
-        opynV2Controller     = OpynV2ControllerLike(opynV2Controller_);
-        opynV2Whitelist      = OpynV2WhitelistLike(opynV2Whitelist_);
+        opynV2Controller     = OpynV2ControllerLike(opynSaviourDependencies_[0]);
+        opynV2Whitelist      = OpynV2WhitelistLike(opynSaviourDependencies_[1]);
+        uniswapV2Router02    = UniswapV2Router02Like(opynSaviourDependencies_[2]);
 
         require(address(safeEngine) != address(0), "OpynSafeSaviour/null-safe-engine");
-        uint256 scaledLiquidationRatio = oracleRelayer.liquidationCRatio(collateralJoin.collateralType()) / CRATIO_SCALE_DOWN;
 
+{
+        uint256 scaledLiquidationRatio = oracleRelayer.liquidationCRatio(collateralJoin.collateralType()) / CRATIO_SCALE_DOWN;
         require(scaledLiquidationRatio > 0, "OpynSafeSaviour/invalid-scaled-liq-ratio");
         require(both(defaultDesiredCollateralizationRatio_ > scaledLiquidationRatio, defaultDesiredCollateralizationRatio_ <= MAX_CRATIO), "OpynSafeSaviour/invalid-default-desired-cratio");
+}
+
         require(collateralJoin.decimals() == 18, "OpynSafeSaviour/invalid-join-decimals");
         require(collateralJoin.contractEnabled() == 1, "OpynSafeSaviour/join-disabled");
 
@@ -111,9 +118,8 @@ contract OpynSafeSaviour is SafeMath, SafeSaviourLike {
     require(opynV2Whitelist.isWhitelistedOtoken(oToken) == true, "OpynSafeSaviour/otoken-not-whitelisted");
 
     // Check if oToken collateral asset is WETH and is put option
-    (address collateral, , , , , bool isPut) = OpynV2OTokenLike(oToken).getOtokenDetails();
+    ( , , , , , bool isPut) = OpynV2OTokenLike(oToken).getOtokenDetails();
 
-    require(collateral == collateralJoin.collateral(), "OpynSafeSaviour/collateral-not-weth");
     require(isPut == true, "OpynSafeSaviour/option-not-put");
 
     if (oTokenWhitelist[oToken] == 0) {
@@ -231,27 +237,76 @@ contract OpynSafeSaviour is SafeMath, SafeSaviourLike {
         // Check that the fiat value of the keeper payout is high enough
         require(keeperPayoutExceedsMinValue(), "OpynSafeSaviour/small-keeper-payout-value");
 
-        // Check that the amount of collateral locked in the safe is bigger than the keeper's payout
-        (uint256 safeLockedCollateral,) =
-          SAFEEngineLike(collateralJoin.safeEngine()).safes(collateralJoin.collateralType(), safeHandler);
-        require(safeLockedCollateral >= mul(keeperPayout, payoutToSAFESize), "OpynSafeSaviour/tiny-safe");
-
-        // Compute and check the validity of the amount of collateralToken used to save the SAFE
+        // Compute the amount of collateral that should be added to bring the safe to desired collateral ratio
         uint256 tokenAmountUsed = tokenAmountUsedToSave(safeHandler);
-        require(both(tokenAmountUsed != MAX_UINT, tokenAmountUsed != 0), "OpynSafeSaviour/invalid-tokens-used-to-save");
 
-        // Check if oToken balance is not empty
-        require(oTokenCover[safeHandler] > 0, "OpynSafeSaviour/empty-otoken-balance");
+        // Retrieve the oTokenCollateral address
+        (address oTokenCollateral, , , , , ) = OpynV2OTokenLike(oTokenSelection[safeHandler]).getOtokenDetails();
 
-        uint256 payout = opynV2Controller.getPayout(oTokenSelection[safeHandler], oTokenCover[safeHandler]);
-        uint256 requiredTokenAmount = add(keeperPayout, tokenAmountUsed);
+        { // Stack too deep guard #1
 
-        // Check that owned oTokens are able to redeem enough collateral to save SAFE
-        require(payout >= requiredTokenAmount, "OpynSafeSaviour/not-enough-cover-deposited");
+          // Check that the amount of collateral locked in the safe is bigger than the keeper's payout
+          (uint256 safeLockedCollateral,) =
+            SAFEEngineLike(collateralJoin.safeEngine()).safes(collateralJoin.collateralType(), safeHandler);
+          require(safeLockedCollateral >= mul(keeperPayout, payoutToSAFESize), "OpynSafeSaviour/tiny-safe");
 
-        uint256 exactOTokenAmount = mul(div(oTokenCover[safeHandler], payout), requiredTokenAmount);
+        }
 
-        {
+          // Compute and check the validity of the amount of collateralToken used to save the SAFE
+          require(both(tokenAmountUsed != MAX_UINT, tokenAmountUsed != 0), "OpynSafeSaviour/invalid-tokens-used-to-save");
+
+          // Check if oToken balance is not empty
+          require(oTokenCover[safeHandler] > 0, "OpynSafeSaviour/empty-otoken-balance");
+          // Build path argument for the uniswap router 02
+
+          // The actual required collateral to provide is the sum of what is needed to bring the safe to its desired collateral ratio + the keeper reward
+          uint256 requiredTokenAmount = add(keeperPayout, tokenAmountUsed);
+
+          // Track balance through redeem / swaps.
+          uint256 track;
+
+        { // Stack too deep guard #2
+
+          // This call reverts if not expired. Retrieves the amount of option collateral retrievable
+          uint256 opynPayout = opynV2Controller.getPayout(oTokenSelection[safeHandler], oTokenCover[safeHandler]);
+
+          // Amount of oToken collateral needed as input for the uniswap call in order to end up
+          // with requiredTokenAmount as result
+          uint256 amount;
+
+        { // Stack too deep guard #2.1
+
+          // Path argument for the uniswap router
+          address[] memory path = new address[](2);
+          path[0] = oTokenCollateral;
+          path[1] = collateralJoin.collateral();
+
+          uint256[] memory amounts = uniswapV2Router02.getAmountsIn(requiredTokenAmount, path);
+
+          amount = amounts[0];
+
+        }
+
+          // Check that the amount of collateral to swap is retrievable
+          require(amount <= opynPayout, "OpynSafeSaviour/insufficient-opyn-payout");
+
+          track = div(mul(oTokenCover[safeHandler], amount), opynPayout);
+
+          // In the case where 1 oToken would retrieve more than 1 collateral and because integer division would round towards 0
+          // ex: 1 oToken retrieves 3 collateral, 5 collateral required, and user owns 2 oToken => (2 * 5) / (2 * 3) => 1.666667 gets rounded to 1, but 2 is required to save
+          // To tackle this, if we have a division remainder and spare oTokens, we increase the used oToken balance by 1
+          if (mod(mul(oTokenCover[safeHandler], amount), opynPayout) != 0) {
+            track += 1;
+          }
+
+          // Check that there are enough oTokens after rounding fix
+          require(track < oTokenCover[safeHandler], "OpynSafeSaviour/insufficient-otokens");
+
+        }
+
+
+        { // Stack too deep guard #3
+
             // Build Opyn Action
             ActionArgsLike[] memory redeemAction = new ActionArgsLike[](1);
             redeemAction[0].actionType = ActionTypeLike.Redeem;
@@ -259,27 +314,48 @@ contract OpynSafeSaviour is SafeMath, SafeSaviourLike {
             redeemAction[0].secondAddress = address(this);
             redeemAction[0].asset = oTokenSelection[safeHandler];
             redeemAction[0].vaultId = 0;
-            redeemAction[0].amount = exactOTokenAmount;
+            redeemAction[0].amount = track;
 
             // Retrieve pre-redeem WETH balance
-            uint256 wethBalance = ERC20Like(collateralJoin.collateral()).balanceOf(address(this));
+            uint256 opynCollateralBalance = ERC20Like(oTokenCollateral).balanceOf(address(this));
 
+            // Trigger oToken collateral redeem
             opynV2Controller.operate(redeemAction);
 
-            // Retrieve post-redeem WETH balance
-            uint256 postRedeemWethBalance = ERC20Like(collateralJoin.collateral()).balanceOf(address(this));
+            // Update the remaining cover
+            oTokenCover[safeHandler] = sub(oTokenCover[safeHandler], track);
 
-            // Check that balance has increased
-            require(postRedeemWethBalance > wethBalance, "OpynSafeSaviour/no-balance-increase-after-redeem");
-
-            uint256 receivedAmount = postRedeemWethBalance - wethBalance;
-
-            // Check that balance has increased of at least required amount
-            require(receivedAmount >= requiredTokenAmount, "OpynSafeSaviour/not-enough-otoken-collateral-redeemed");
+            // Update the tracked balance to the amount retrieved
+            track = sub(ERC20Like(oTokenCollateral).balanceOf(address(this)), opynCollateralBalance);
         }
 
-        // Update the remaining cover
-        oTokenCover[safeHandler] = sub(oTokenCover[safeHandler], exactOTokenAmount);
+        { // Stack too deep guard #4
+
+            // Retrieve pre-swap WETH balance
+            uint256 wethBalance = ERC20Like(collateralJoin.collateral()).balanceOf(address(this));
+
+            { // Stack too deep guard #4.1
+
+              // Path argument for the uniswap router
+              address[] memory path = new address[](2);
+              path[0] = oTokenCollateral;
+              path[1] = collateralJoin.collateral();
+
+              uniswapV2Router02.swapExactTokensForTokens(track, requiredTokenAmount, path, address(this), block.timestamp);
+            }
+
+            // Retrieve post-swap WETH balance
+            track = sub(ERC20Like(collateralJoin.collateral()).balanceOf(address(this)), wethBalance, "OpynSafeSaviour/no-balance-increase-after-redeem");
+
+            // Check that balance has increased of at least required amount
+            require(track >= requiredTokenAmount, "OpynSafeSaviour/not-enough-otoken-collateral-swapped");
+
+            // Update balance in case of excess
+            if (track > requiredTokenAmount) {
+              requiredTokenAmount = track;
+            }
+
+        }
 
         // Mark the SAFE in the registry as just being saved
         saviourRegistry.markSave(collateralType, safeHandler);
@@ -299,8 +375,8 @@ contract OpynSafeSaviour is SafeMath, SafeSaviourLike {
           int256(0)
         );
 
-        // Send the fee to the keeper
-        collateralToken.transfer(keeper, keeperPayout);
+        // Send the fee to the keeper, the prize is recomputed to prevent dust
+        collateralToken.transfer(keeper, sub(requiredTokenAmount, tokenAmountUsed));
 
         // Emit an event
         emit SaveSAFE(keeper, collateralType, safeHandler, tokenAmountUsed);
