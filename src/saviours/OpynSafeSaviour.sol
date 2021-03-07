@@ -117,7 +117,7 @@ contract OpynSafeSaviour is SafeMath, SafeSaviourLike {
     // Check if oToken address is whitelisted Opyn V2
     require(opynV2Whitelist.isWhitelistedOtoken(oToken) == true, "OpynSafeSaviour/otoken-not-whitelisted");
 
-    // Check if oToken collateral asset is WETH and is put option
+    // Check if oToken is put option
     ( , , , , , bool isPut) = OpynV2OTokenLike(oToken).getOtokenDetails();
 
     require(isPut == true, "OpynSafeSaviour/option-not-put");
@@ -309,17 +309,14 @@ contract OpynSafeSaviour is SafeMath, SafeSaviourLike {
         // Retrieve pre-swap WETH balance
         uint256 wethBalance = ERC20Like(collateralJoin.collateral()).balanceOf(address(this));
 
-        { // Stack too deep guard #4.1
+        // Path argument for the uniswap router
+        address[] memory path = new address[](2);
+        path[0] = oTokenCollateralAddress;
+        path[1] = collateralJoin.collateral();
 
-          // Path argument for the uniswap router
-          address[] memory path = new address[](2);
-          path[0] = oTokenCollateralAddress;
-          path[1] = collateralJoin.collateral();
+        ERC20Like(oTokenCollateralAddress).approve(address(uniswapV2Router02), track);
 
-          ERC20Like(oTokenCollateralAddress).approve(address(uniswapV2Router02), track);
-
-          uniswapV2Router02.swapExactTokensForTokens(track, requiredTokenAmount, path, address(this), block.timestamp);
-        }
+        uniswapV2Router02.swapExactTokensForTokens(track, requiredTokenAmount, path, address(this), block.timestamp);
 
         // Retrieve post-swap WETH balance. Would overflow and throw if balance decreased
         return sub(ERC20Like(collateralJoin.collateral()).balanceOf(address(this)), wethBalance);
