@@ -91,11 +91,9 @@ contract OpynSafeSaviour is SafeMath, SafeSaviourLike {
 
         require(address(safeEngine) != address(0), "OpynSafeSaviour/null-safe-engine");
 
-{
         uint256 scaledLiquidationRatio = oracleRelayer.liquidationCRatio(collateralJoin.collateralType()) / CRATIO_SCALE_DOWN;
         require(scaledLiquidationRatio > 0, "OpynSafeSaviour/invalid-scaled-liq-ratio");
         require(both(defaultDesiredCollateralizationRatio_ > scaledLiquidationRatio, defaultDesiredCollateralizationRatio_ <= MAX_CRATIO), "OpynSafeSaviour/invalid-default-desired-cratio");
-}
 
         require(collateralJoin.decimals() == 18, "OpynSafeSaviour/invalid-join-decimals");
         require(collateralJoin.contractEnabled() == 1, "OpynSafeSaviour/join-disabled");
